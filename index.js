@@ -32,18 +32,7 @@ async function run() {
     const products = database.collection("products");
 
     app.post('/add-product', async (req, res) => {
-        // const product = req.body;
-        const product = {
-            title: "BD Premium Home jersey 26/27",
-            desc: "This is a high quality jersey with editable font and patch. You can write your name on the back side of the jersey by just adding 150tk extra.",
-            imageLink: "https://ibb.co.com/chXmhrp7",
-            price: 1050,
-            size: ["L", "M", "XL"],
-            patch: false,
-            font: true,
-            featured: true,
-            stock: 10,
-        }
+        const product = req.body;
 
         const result = await products.insertOne(product);
         console.log(result);
