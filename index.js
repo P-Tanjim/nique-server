@@ -32,7 +32,21 @@ app.get('/hi', (req, res) => res.send('hi'));
 
 app.post('/add-product', async (req, res) => {
   if (!products) return res.status(503).json({ error: 'Database not connected yet' });
-  const result = await products.insertOne(req.body);
+  const product = {
+    "title": "BD Premium Home jersey 26/27",
+    "desc": "This is a high quality jersey with editable font and patch. You can write your name on the back side of the jersey by just adding 150tk extra.",
+    "imageLink": ["https://ibb.co.com/chXmhrp7"],
+    "price": 1050,
+    "size": ["L", "M", "XL"],
+    "patch": false,
+    "font": true,
+    "featured": true,
+    "stock": 10,
+    "team": "real-madrid",
+    "seassion": "25-26",
+    "category": "BD premium"
+  }
+  const result = await products.insertOne(product);
   res.json(result);
 });
 
