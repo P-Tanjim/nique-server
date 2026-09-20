@@ -30,24 +30,29 @@ connectDB().catch((err) => console.error("Mongo connection failed:", err));
 app.get('/', (req, res) => res.send('Hello World!'));
 app.get('/hi', (req, res) => res.send('hi'));
 
-app.post('/add-product', async (req, res) => {
+app.get('/featured-products', async (req, res) => {
   if (!products) return res.status(503).json({ error: 'Database not connected yet' });
-  const product = {
-    "title": "BD Premium Home jersey 26/27",
-    "desc": "This is a high quality jersey with editable font and patch. You can write your name on the back side of the jersey by just adding 150tk extra.",
-    "imageLink": ["https://ibb.co.com/chXmhrp7"],
-    "price": 1050,
-    "size": ["L", "M", "XL"],
-    "patch": false,
-    "font": true,
-    "featured": true,
-    "stock": 10,
-    "team": "real-madrid",
-    "seassion": "25-26",
-    "category": "BD premium"
+
+  try {
+    const result = await products.aggregate([
+      {
+        $match: {
+          featured: true
+        }
+      },
+      {
+        $project: {
+          title: 1,
+          imageLink: { $arrayElemAt: ['$imagesLink', 0] }
+        }
+      }
+    ]).toArray();
+    res.status(200).json({data: result});
   }
-  const result = await products.insertOne(product);
-  res.json(result);
+  catch (err) {
+    res.status(500).json({message: "Something Went Wrong." })
+  }
+
 });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
