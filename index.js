@@ -114,12 +114,13 @@ app.post('/admin/products', async (req, res) => {
   try {
     const {
       title, desc, price, size = [], patch = false, font = false,
-      featured = false, stock, team, seassion, category,
+      featured = false, discount = false, beforePrice,
+      stock, team, seassion, category,
       imagesLink = [], patchsImg = []
     } = req.body;
 
     // 1. Basic field validation
-    if (!title || !price || !category) {
+    if (!title || price === undefined || price === null || !category) {
       return res.status(400).json({ error: 'title, price and category are required.' });
     }
 
@@ -128,12 +129,31 @@ app.post('/admin/products', async (req, res) => {
       return res.status(400).json({ error: 'At least one size must be selected.' });
     }
 
-    // 3. Product image validation
+    // 3. Discount validation & calculation
+    const isDiscount = Boolean(discount);
+    const priceNum = Number(price);
+    const beforePriceNum = isDiscount ? Number(beforePrice) : 0;
+
+    if (isDiscount) {
+      if (!beforePrice || beforePriceNum <= 0) {
+        return res.status(400).json({ error: 'Valid before price is required when discount is enabled.' });
+      }
+      if (beforePriceNum <= priceNum) {
+        return res.status(400).json({ error: 'Before price must be greater than selling price.' });
+      }
+    }
+
+    // Safely recalculate discountPercent on the server
+    const discountPercent = isDiscount && beforePriceNum > priceNum
+      ? Math.round(((beforePriceNum - priceNum) / beforePriceNum) * 100)
+      : 0;
+
+    // 4. Product image validation
     if (!Array.isArray(imagesLink) || imagesLink.length === 0) {
       return res.status(400).json({ error: 'At least one product image is required.' });
     }
 
-    // 4. Patch image validation
+    // 5. Patch image validation
     if (patch && (!Array.isArray(patchsImg) || patchsImg.length === 0)) {
       return res.status(400).json({ error: 'Patch is enabled but no patch images were provided.' });
     }
@@ -141,7 +161,10 @@ app.post('/admin/products', async (req, res) => {
     const doc = {
       title,
       desc: desc ?? '',
-      price: Number(price),
+      price: priceNum,
+      discount: isDiscount,
+      beforePrice: beforePriceNum,
+      discountPercent,
       size,
       patch: Boolean(patch),
       font: Boolean(font),
