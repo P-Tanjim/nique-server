@@ -116,7 +116,7 @@ app.post('/admin/products', async (req, res) => {
       title, desc, price, size = [], patch = false, font = false,
       featured = false, discount = false, beforePrice,
       stock, team, seassion, category,
-      imagesLink = [], patchsImg = []
+      imagesLink = [], patchsImg = [], fontImg = []
     } = req.body;
 
     // 1. Basic field validation
@@ -158,6 +158,11 @@ app.post('/admin/products', async (req, res) => {
       return res.status(400).json({ error: 'Patch is enabled but no patch images were provided.' });
     }
 
+    // 6. Font image validation
+    if (fontImg && (!Array.isArray(fontImg) || fontImg.length === 0)) {
+      return res.status(400).json({ error: 'font is enabled but no font images were provided.' });
+    }
+
     const doc = {
       title,
       desc: desc ?? '',
@@ -175,6 +180,7 @@ app.post('/admin/products', async (req, res) => {
       category,
       imagesLink,
       patchsImg: patch ? patchsImg : [],
+      fontImg: patch ? fontImg : [],
       createdAt: new Date(),
     };
 
