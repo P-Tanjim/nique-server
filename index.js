@@ -49,10 +49,10 @@ app.get('/featured-products', async (req, res) => {
         }
       }
     ]).toArray();
-    res.status(200).json({data: result});
+    res.status(200).json({ data: result });
   }
   catch (err) {
-    res.status(500).json({message: "Something Went Wrong." })
+    res.status(500).json({ message: "Something Went Wrong." })
   }
 
 });
@@ -80,14 +80,29 @@ app.get('/testimonials', async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(20)
       .toArray();
-    console.log(result)
-      
+
     res.status(200).json({ data: result });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Something went wrong." });
   }
 });
+
+app.get('/products', async (req, res) => {
+  if (!products) return res.status(503).json({ error: 'Database not connected yet' });
+
+  try {
+    const limit = parseInt(req.query.limit)
+    const skip = parseInt(req.query.skip) || 0;
+    const result = await products.find({}).skip(skip).limit(limit).toArray()
+
+      res.status(200).json({ data: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Something went wrong." });
+  }
+
+})
 
 // --- NEW: used by the dashboard's "Add product" page -----------------------
 // PLACEHOLDER — no admin/auth check yet. Before this ships, gate it behind
@@ -97,10 +112,10 @@ app.post('/admin/products', async (req, res) => {
   if (!products) return res.status(503).json({ error: 'Database not connected yet' });
 
   try {
-    const { 
-      title, desc, price, size = [], patch = false, font = false, 
-      featured = false, stock, team, seassion, category, 
-      imagesLink = [], patchsImg = [] 
+    const {
+      title, desc, price, size = [], patch = false, font = false,
+      featured = false, stock, team, seassion, category,
+      imagesLink = [], patchsImg = []
     } = req.body;
 
     // 1. Basic field validation
