@@ -17,11 +17,13 @@ const client = new MongoClient(uri, {
 });
 
 let products; // filled in once connected
+let testimonials;
 
 async function connectDB() {
   await client.connect();
   const database = client.db('nique_sports');
   products = database.collection("products");
+  testimonials = database.collection("testimonials")
   console.log("MongoDB connected");
 }
 connectDB().catch((err) => console.error("Mongo connection failed:", err));
@@ -65,6 +67,25 @@ app.get('/products/:id', async (req, res) => {
   } catch (err) {
     console.log(err)
     res.status(400).json({ data: null });
+  }
+});
+
+app.get('/testimonials', async (req, res) => {
+  if (!client) return res.status(503).json({ error: 'Database not connected' });
+
+  try {
+    // Fetch top 20 latest reviews
+    const result = await testimonials
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .toArray();
+    console.log(result)
+      
+    res.status(200).json({ data: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Something went wrong." });
   }
 });
 
