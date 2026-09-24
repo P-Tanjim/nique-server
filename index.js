@@ -59,13 +59,10 @@ app.get('/featured-products', async (req, res) => {
 
 app.get('/products/:id', async (req, res) => {
   try {
-    console.log(req.params.id)
     const product = await products.findOne({ _id: new ObjectId(req.params.id) });
-    console.log(product)
     if (!product) return res.status(404).json({ data: null });
     res.status(200).json({ data: product });
   } catch (err) {
-    console.log(err)
     res.status(400).json({ data: null });
   }
 });
@@ -116,7 +113,7 @@ app.post('/admin/products', async (req, res) => {
       title, desc, price, size = [], patch = false, font = false,
       featured = false, discount = false, beforePrice,
       stock, team, seassion, category,
-      imagesLink = [], patchsImg = [], fontImg = []
+      imagesLink = [], patchsImg = [], fontsImg = []
     } = req.body;
 
     // 1. Basic field validation
@@ -159,7 +156,7 @@ app.post('/admin/products', async (req, res) => {
     }
 
     // 6. Font image validation
-    if (fontImg && (!Array.isArray(fontImg) || fontImg.length === 0)) {
+    if (fontsImg && (!Array.isArray(fontsImg) || fontsImg.length === 0)) {
       return res.status(400).json({ error: 'font is enabled but no font images were provided.' });
     }
 
@@ -180,7 +177,7 @@ app.post('/admin/products', async (req, res) => {
       category,
       imagesLink,
       patchsImg: patch ? patchsImg : [],
-      fontImg: patch ? fontImg : [],
+      fontsImg: font ? fontsImg : [],
       createdAt: new Date(),
     };
 
