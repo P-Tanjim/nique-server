@@ -106,67 +106,124 @@ app.get('/products', async (req, res) => {
 // whatever session/isAdmin check you use elsewhere, or anyone who finds
 // this URL can insert products.
 app.post('/admin/products', async (req, res) => {
-  if (!products) return res.status(503).json({ error: 'Database not connected yet' });
+  if (!products) {
+    return res.status(503).json({ error: 'Database not connected yet' });
+  }
 
   try {
     const {
-      title, desc, price, size = [], patch = false, font = false,
-      featured = false, discount = false, beforePrice,
-      stock, team, seassion, category,
-      imagesLink = [], patchsImg = [], fontsImg = []
-    } = req.body;
+      title,
+      desc,
+      price,
+      size = [],
+      patch = false,
+      font = false,
+      featured = false,
+      discount = false,
+      beforePrice,
+      stock,
+      team,
+      seassion,
+      category,
+      imagesLink = [],
+      patchsImg = [],
+      fontsImg = [],
+    } = req.body ?? {};
 
-    // 1. Basic field validation
-    if (!title || price === undefined || price === null || !category) {
+    if (!title?.trim() || price === undefined || price === null || !category?.trim()) {
       return res.status(400).json({ error: 'title, price and category are required.' });
     }
 
-    // 2. Size validation
+    const priceNum = Number(price);
+    if (!Number.isFinite(priceNum) || priceNum < 0) {
+      return res.status(400).json({ error: 'Price must be a valid non-negative number.' });
+    }
+
     if (!Array.isArray(size) || size.length === 0) {
       return res.status(400).json({ error: 'At least one size must be selected.' });
     }
 
-    // 3. Discount validation & calculation
     const isDiscount = Boolean(discount);
-    const priceNum = Number(price);
     const beforePriceNum = isDiscount ? Number(beforePrice) : 0;
 
-    if (isDiscount) {
-      if (!beforePrice || beforePriceNum <= 0) {
-        return res.status(400).json({ error: 'Valid before price is required when discount is enabled.' });
+    if (isDiscount && (!Number.isFinite(beforePriceNum) || beforePriceNum <= priceNum)) {
+      return res.status(400).json({
+        error: 'Before price must be a valid amount greater than the selling price.',
+      });
+    }
+
+    if (
+      !Array.isArray(imagesLink) ||
+      imagesLink.length === 0 ||
+      imagesLink.some((image) => typeof image !== 'string' || !image.trim())
+    ) {
+      return res.status(400).json({ error: 'At least one valid product image is required.' });
+    }
+
+    function normalizePricedImages(items, label) {
+      if (!Array.isArray(items)) {
+        return { error: `${label} must be an array.` };
       }
-      if (beforePriceNum <= priceNum) {
-        return res.status(400).json({ error: 'Before price must be greater than selling price.' });
+
+      const normalized = [];
+
+      for (const [index, item] of items.entries()) {
+        const isLegacyUrl = typeof item === 'string';
+        const image = isLegacyUrl ? item : item?.image;
+        const rawPrice = isLegacyUrl ? 0 : item?.price;
+        const optionPrice = Number(rawPrice);
+
+        if (typeof image !== 'string' || !image.trim()) {
+          return { error: `${label} option ${index + 1} must include an image URL.` };
+        }
+
+        if (
+          rawPrice === undefined ||
+          rawPrice === null ||
+          rawPrice === '' ||
+          !Number.isFinite(optionPrice) ||
+          optionPrice < 0
+        ) {
+          return { error: `${label} option ${index + 1} must have a valid non-negative price.` };
+        }
+
+        normalized.push({ image: image.trim(), price: optionPrice });
       }
+
+      return { value: normalized };
     }
 
-    // Safely recalculate discountPercent on the server
-    const discountPercent = isDiscount && beforePriceNum > priceNum
-      ? Math.round(((beforePriceNum - priceNum) / beforePriceNum) * 100)
-      : 0;
+    const patchOptions = patch
+      ? normalizePricedImages(patchsImg, 'Patch')
+      : { value: [] };
 
-    // 4. Product image validation
-    if (!Array.isArray(imagesLink) || imagesLink.length === 0) {
-      return res.status(400).json({ error: 'At least one product image is required.' });
+    if (patchOptions.error) {
+      return res.status(400).json({ error: patchOptions.error });
+    }
+    if (patch && patchOptions.value.length === 0) {
+      return res.status(400).json({ error: 'Patch is enabled but no patch options were provided.' });
     }
 
-    // 5. Patch image validation
-    if (patch && (!Array.isArray(patchsImg) || patchsImg.length === 0)) {
-      return res.status(400).json({ error: 'Patch is enabled but no patch images were provided.' });
-    }
+    const fontOptions = font
+      ? normalizePricedImages(fontsImg, 'Font')
+      : { value: [] };
 
-    // 6. Font image validation
-    if (fontsImg && (!Array.isArray(fontsImg) || fontsImg.length === 0)) {
-      return res.status(400).json({ error: 'font is enabled but no font images were provided.' });
+    if (fontOptions.error) {
+      return res.status(400).json({ error: fontOptions.error });
+    }
+    if (font && fontOptions.value.length === 0) {
+      return res.status(400).json({ error: 'Font is enabled but no font options were provided.' });
     }
 
     const doc = {
-      title,
+      title: title.trim(),
       desc: desc ?? '',
       price: priceNum,
       discount: isDiscount,
       beforePrice: beforePriceNum,
-      discountPercent,
+      discountPercent: isDiscount
+        ? Math.round(((beforePriceNum - priceNum) / beforePriceNum) * 100)
+        : 0,
       size,
       patch: Boolean(patch),
       font: Boolean(font),
@@ -174,18 +231,18 @@ app.post('/admin/products', async (req, res) => {
       stock: Number(stock) || 0,
       team: team ?? '',
       seassion: seassion ?? '',
-      category,
+      category: category.trim(),
       imagesLink,
-      patchsImg: patch ? patchsImg : [],
-      fontsImg: font ? fontsImg : [],
+      patchsImg: patchOptions.value,
+      fontsImg: fontOptions.value,
       createdAt: new Date(),
     };
-
+    
     const result = await products.insertOne(doc);
-    res.status(201).json({ data: { _id: result.insertedId, ...doc } });
+    return res.status(201).json({ data: { _id: result.insertedId, ...doc } });
   } catch (err) {
-    console.log(err);
-    res.status(500).json({ error: 'Something went wrong while creating the product.' });
+    console.error(err);
+    return res.status(500).json({ error: 'Something went wrong while creating the product.' });
   }
 });
 
