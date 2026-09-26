@@ -246,4 +246,17 @@ app.post('/admin/products', async (req, res) => {
   }
 });
 
+app.get('/admin/feature-count', async (req, res) => {
+  if (!products) return res.status(503).json({ error: 'Database not connected yet' });
+
+  try {
+    const result = await products.countDocuments({featured: true})
+
+    res.status(200).json({ data: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Something went wrong." });
+  }
+})
+
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
