@@ -259,4 +259,193 @@ app.get('/admin/feature-count', async (req, res) => {
   }
 })
 
+app.put('/admin/products/:id', async (req, res) => {
+  if (!products) {
+    return res.status(503).json({ error: 'Database not connected yet' });
+  }
+
+  let productId;
+  try {
+    productId = new ObjectId(req.params.id);
+  } catch {
+    return res.status(400).json({ error: 'Invalid product id.' });
+  }
+
+  try {
+    const {
+      title,
+      desc = '',
+      price,
+      size = [],
+      patch = false,
+      font = false,
+      featured = false,
+      discount = false,
+      beforePrice,
+      stock = 0,
+      team = '',
+      seassion = '',
+      category,
+      imagesLink = [],
+      patchsImg = [],
+      fontsImg = [],
+    } = req.body ?? {};
+
+    if (!title?.trim() || price === undefined || price === null || !category?.trim()) {
+      return res.status(400).json({ error: 'title, price and category are required.' });
+    }
+
+    const priceNum = Number(price);
+    if (!Number.isFinite(priceNum) || priceNum < 0) {
+      return res.status(400).json({ error: 'Price must be a valid non-negative number.' });
+    }
+
+    const stockNum = Number(stock);
+    if (!Number.isFinite(stockNum) || stockNum < 0) {
+      return res.status(400).json({ error: 'Stock must be a valid non-negative number.' });
+    }
+
+    if (!Array.isArray(size) || size.length === 0) {
+      return res.status(400).json({ error: 'At least one size must be selected.' });
+    }
+
+    const isDiscount = Boolean(discount);
+    const beforePriceNum = isDiscount ? Number(beforePrice) : 0;
+
+    if (isDiscount && (!Number.isFinite(beforePriceNum) || beforePriceNum <= priceNum)) {
+      return res.status(400).json({
+        error: 'Before price must be greater than the selling price.',
+      });
+    }
+
+    if (
+      !Array.isArray(imagesLink) ||
+      imagesLink.length === 0 ||
+      imagesLink.some((image) => typeof image !== 'string' || !image.trim())
+    ) {
+      return res.status(400).json({ error: 'At least one valid product image is required.' });
+    }
+
+    function normalizePricedImages(items, label) {
+      if (!Array.isArray(items)) {
+        return { error: `${label} must be an array.` };
+      }
+
+      const normalized = [];
+
+      for (const [index, item] of items.entries()) {
+        const isLegacyUrl = typeof item === 'string';
+        const image = isLegacyUrl ? item : item?.image;
+        const rawPrice = isLegacyUrl ? 0 : item?.price;
+        const optionPrice = Number(rawPrice);
+
+        if (typeof image !== 'string' || !image.trim()) {
+          return { error: `${label} option ${index + 1} must include an image URL.` };
+        }
+
+        if (
+          rawPrice === undefined ||
+          rawPrice === null ||
+          rawPrice === '' ||
+          !Number.isFinite(optionPrice) ||
+          optionPrice < 0
+        ) {
+          return { error: `${label} option ${index + 1} must have a valid non-negative price.` };
+        }
+
+        normalized.push({ image: image.trim(), price: optionPrice });
+      }
+
+      return { value: normalized };
+    }
+
+    const patchOptions = patch
+      ? normalizePricedImages(patchsImg, 'Patch')
+      : { value: [] };
+
+    if (patchOptions.error) {
+      return res.status(400).json({ error: patchOptions.error });
+    }
+    if (patch && patchOptions.value.length === 0) {
+      return res.status(400).json({ error: 'Patch is enabled but no patch options were provided.' });
+    }
+
+    const fontOptions = font
+      ? normalizePricedImages(fontsImg, 'Font')
+      : { value: [] };
+
+    if (fontOptions.error) {
+      return res.status(400).json({ error: fontOptions.error });
+    }
+    if (font && fontOptions.value.length === 0) {
+      return res.status(400).json({ error: 'Font is enabled but no font options were provided.' });
+    }
+
+    const updatedProduct = {
+      title: title.trim(),
+      desc,
+      price: priceNum,
+      discount: isDiscount,
+      beforePrice: beforePriceNum,
+      discountPercent: isDiscount
+        ? Math.round(((beforePriceNum - priceNum) / beforePriceNum) * 100)
+        : 0,
+      size,
+      patch: Boolean(patch),
+      font: Boolean(font),
+      featured: Boolean(featured),
+      stock: stockNum,
+      team,
+      seassion,
+      category: category.trim(),
+      imagesLink,
+      patchsImg: patchOptions.value,
+      fontsImg: fontOptions.value,
+      updatedAt: new Date(),
+    };
+
+    const result = await products.updateOne(
+      { _id: productId },
+      { $set: updatedProduct }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: 'Product not found.' });
+    }
+
+    return res.status(200).json({
+      data: { _id: productId, ...updatedProduct },
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Something went wrong while updating the product.' });
+  }
+});
+
+app.delete('/admin/products/:id', async (req, res) => {
+  if (!products) {
+    return res.status(503).json({ error: 'Database not connected yet' });
+  }
+
+  let productId;
+  try {
+    productId = new ObjectId(req.params.id);
+  } catch {
+    return res.status(400).json({ error: 'Invalid product id.' });
+  }
+
+  try {
+    const result = await products.deleteOne({ _id: productId });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'Product not found.' });
+    }
+
+    return res.status(200).json({ data: { _id: req.params.id } });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Something went wrong while deleting the product.' });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
