@@ -757,4 +757,51 @@ app.get('/admin/orders', async (req, res) => {
   }
 });
 
+app.put('/admin/orders/:id/status', async (req, res) => {
+  if (!orders) {
+    return res.status(503).json({ error: 'Database not connected yet' });
+  }
+
+  const orderId = String(req.params.id ?? '').trim();
+  const requestedStatus = req.body?.status;
+  if (!orderId || orderId.length > 100 || typeof requestedStatus !== 'string') {
+    return res.status(400).json({ error: 'A valid order ID and status are required.' });
+  }
+
+  const statusText = requestedStatus.trim();
+  if (!statusText || statusText.length > 40) {
+    return res.status(400).json({ error: 'Status must be between 1 and 40 characters.' });
+  }
+
+  const knownStatuses = new Map([
+    ['pending', 'pending'],
+    ['processing', 'processing'],
+    ['shipped', 'shipped'],
+    ['on the way', 'shipped'],
+    ['delivered', 'delivered'],
+    ['cancelled', 'cancelled'],
+    ['canceled', 'cancelled'],
+  ]);
+  const status = knownStatuses.get(statusText.toLowerCase()) ?? statusText;
+  const filter = ObjectId.isValid(orderId)
+    ? { _id: new ObjectId(orderId) }
+    : { orderId };
+
+  try {
+    const result = await orders.updateOne(
+      filter,
+      { $set: { status, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    return res.status(200).json({ data: { id: orderId, status } });
+  } catch (err) {
+    console.error('Failed to update order status:', err);
+    return res.status(500).json({ error: 'Could not update order status.' });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
