@@ -12,6 +12,62 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+
+function requiredText(value, label, maxLength, minLength = 1) {
+  if (typeof value !== 'string') {
+    throw new OrderRequestError(400, `${label} must be text.`);
+  }
+  const normalized = value.trim();
+  if (normalized.length < minLength || normalized.length > maxLength) {
+    throw new OrderRequestError(400, `${label} must be between ${minLength} and ${maxLength} characters.`);
+  }
+  return normalized;
+}
+
+function optionalText(value, label, maxLength) {
+  if (value === undefined || value === null || value === '') return '';
+  return requiredText(value, label, maxLength, 0);
+}
+
+function limitOrderRequests(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  const windowMs = 10 * 60 * 1000;
+  const maxRequests = 8;
+  let bucket = orderRateBuckets.get(key);
+
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { count: 0, resetAt: now + windowMs };
+    orderRateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+
+  if (bucket.count > maxRequests) {
+    res.set('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
+    return res.status(429).json({ error: 'Too many order attempts. Please try again shortly.' });
+  }
+  return next();
+}
+
+function findPricedOption(options, image, label) {
+  if (!Array.isArray(options)) {
+    throw new OrderRequestError(409, `${label} options are no longer available.`);
+  }
+  const found = options.find((entry) => (typeof entry === 'string' ? entry : entry?.image) === image);
+  if (!found) throw new OrderRequestError(400, `The selected ${label.toLowerCase()} is invalid.`);
+
+  const price = typeof found === 'string' ? 0 : Number(found.price);
+  if (!Number.isFinite(price) || price < 0) {
+    throw new OrderRequestError(409, `The selected ${label.toLowerCase()} has an invalid price.`);
+  }
+  return { image, price };
+}
+
+function money(value) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+
 const uri = process.env.MONGODB_URL;
 const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
@@ -104,6 +160,235 @@ app.get('/products', async (req, res) => {
   }
 
 })
+
+const DELIVERY_FEES = Object.freeze({
+  'inside-dhaka': 70,
+  'outside-dhaka': 120,
+});
+const MAX_ORDER_LINES = 30;
+const MAX_QUANTITY_PER_LINE = 20;
+const MAX_PATCHES_PER_LINE = 4;
+const orderRateBuckets = new Map();
+
+class OrderRequestError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+app.post('/orders', limitOrderRequests, async (req, res) => {
+  if (!products || !orders) {
+    return res.status(503).json({ error: 'Order service is not ready.' });
+  }
+
+  let session;
+  try {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new OrderRequestError(400, 'A valid order body is required.');
+    }
+
+    const customerInput = body.customer;
+    if (!customerInput || typeof customerInput !== 'object' || Array.isArray(customerInput)) {
+      throw new OrderRequestError(400, 'Customer details are required.');
+    }
+
+    const customer = {
+      name: requiredText(customerInput.name, 'Name', 100),
+      address: requiredText(customerInput.address, 'Address', 500, 5),
+      phone: requiredText(customerInput.phone, 'Phone number', 11),
+      phone2: optionalText(customerInput.phone2, 'Alternate phone number', 11),
+      note: optionalText(customerInput.note, 'Order note', 1000),
+    };
+    if (!/^01[3-9]\d{8}$/.test(customer.phone)) {
+      throw new OrderRequestError(400, 'Enter a valid 11-digit phone number.');
+    }
+    if (customer.phone2 && !/^01[3-9]\d{8}$/.test(customer.phone2)) {
+      throw new OrderRequestError(400, 'Enter a valid alternate phone number.');
+    }
+
+    const deliveryArea = body.deliveryArea;
+    if (!Object.hasOwn(DELIVERY_FEES, deliveryArea)) {
+      throw new OrderRequestError(400, 'Choose a valid delivery area.');
+    }
+
+    if (!Array.isArray(body.items) || body.items.length === 0 || body.items.length > MAX_ORDER_LINES) {
+      throw new OrderRequestError(400, `An order must contain between 1 and ${MAX_ORDER_LINES} items.`);
+    }
+
+    const requestedItems = body.items.map((input, index) => {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        throw new OrderRequestError(400, `Item ${index + 1} is invalid.`);
+      }
+      if (typeof input.productId !== 'string' || !/^[a-f\d]{24}$/i.test(input.productId)) {
+        throw new OrderRequestError(400, `Item ${index + 1} has an invalid product ID.`);
+      }
+      if (!Number.isSafeInteger(input.quantity) || input.quantity < 1 || input.quantity > MAX_QUANTITY_PER_LINE) {
+        throw new OrderRequestError(400, `Item ${index + 1} quantity must be between 1 and ${MAX_QUANTITY_PER_LINE}.`);
+      }
+
+      const size = requiredText(input.size, `Item ${index + 1} size`, 12);
+      const customization = input.customization ?? {};
+      if (typeof customization !== 'object' || Array.isArray(customization)) {
+        throw new OrderRequestError(400, `Item ${index + 1} customization is invalid.`);
+      }
+
+      const customName = optionalText(customization.name, `Item ${index + 1} name`, 14).toUpperCase();
+      const customNumber = optionalText(customization.number, `Item ${index + 1} number`, 2);
+      if (customNumber && !/^\d{1,2}$/.test(customNumber)) {
+        throw new OrderRequestError(400, `Item ${index + 1} number must contain up to two digits.`);
+      }
+      const fontImage = customization.fontImage === undefined || customization.fontImage === ''
+        ? ''
+        : requiredText(customization.fontImage, `Item ${index + 1} font image`, 2048);
+      if (!fontImage && (customName || customNumber)) {
+        throw new OrderRequestError(400, `Choose a font before adding name or number to item ${index + 1}.`);
+      }
+
+      if (input.patches !== undefined && !Array.isArray(input.patches)) {
+        throw new OrderRequestError(400, `Item ${index + 1} patches must be a list.`);
+      }
+      const patches = input.patches ?? [];
+      if (patches.length > MAX_PATCHES_PER_LINE || patches.some((patch) => typeof patch !== 'string' || patch.length > 2048)) {
+        throw new OrderRequestError(400, `Item ${index + 1} has invalid patch selections.`);
+      }
+      if (new Set(patches).size !== patches.length) {
+        throw new OrderRequestError(400, `Item ${index + 1} contains a duplicate patch.`);
+      }
+
+      return {
+        productId: new ObjectId(input.productId),
+        quantity: input.quantity,
+        size,
+        customName,
+        customNumber,
+        fontImage,
+        patches,
+      };
+    });
+
+    session = client.startSession();
+    let savedOrder;
+
+    await session.withTransaction(async () => {
+      const productCache = new Map();
+      const stockDemand = new Map();
+      const orderItems = [];
+
+      for (const input of requestedItems) {
+        const productId = input.productId.toHexString();
+        let product = productCache.get(productId);
+        if (!product) {
+          product = await products.findOne({ _id: input.productId }, { session });
+          if (!product) throw new OrderRequestError(404, 'A product in your cart no longer exists.');
+          productCache.set(productId, product);
+        }
+
+        if (!Array.isArray(product.size) || !product.size.includes(input.size)) {
+          throw new OrderRequestError(400, `${product.title} does not have size ${input.size}.`);
+        }
+
+        const basePrice = Number(product.price);
+        if (!Number.isFinite(basePrice) || basePrice < 0) {
+          throw new OrderRequestError(409, `${product.title} has an invalid price.`);
+        }
+
+        let font = null;
+        if (input.fontImage) {
+          if (product.font !== true) throw new OrderRequestError(400, `${product.title} does not offer custom fonts.`);
+          font = findPricedOption(product.fontsImg, input.fontImage, 'Font');
+        }
+
+        if ((input.customName || input.customNumber) && !font) {
+          throw new OrderRequestError(400, `Select a font for ${product.title} before entering name or number.`);
+        }
+
+        if (input.patches.length && product.patch !== true) {
+          throw new OrderRequestError(400, `${product.title} does not offer patches.`);
+        }
+        const patches = input.patches.map((image) => findPricedOption(product.patchsImg, image, 'Patch'));
+        const optionsPrice = (font?.price ?? 0) + patches.reduce((sum, patch) => sum + patch.price, 0);
+        const unitPrice = money(basePrice + optionsPrice);
+        const originalBasePrice = product.discount === true ? Number(product.beforePrice) : 0;
+        const originalUnitPrice = Number.isFinite(originalBasePrice) && originalBasePrice > basePrice
+          ? money(originalBasePrice + optionsPrice)
+          : null;
+
+        stockDemand.set(productId, (stockDemand.get(productId) ?? 0) + input.quantity);
+        orderItems.push({
+          productId: input.productId,
+          title: product.title,
+          image: product.imagesLink?.[0] ?? '',
+          size: input.size,
+          quantity: input.quantity,
+          basePrice: money(basePrice),
+          font,
+          patches,
+          customization: {
+            name: input.customName,
+            number: input.customNumber,
+          },
+          unitPrice,
+          originalUnitPrice,
+          lineTotal: money(unitPrice * input.quantity),
+        });
+      }
+
+      for (const [productId, quantity] of stockDemand) {
+        const result = await products.updateOne(
+          { _id: new ObjectId(productId), stock: { $gte: quantity } },
+          { $inc: { stock: -quantity } },
+          { session }
+        );
+        if (result.matchedCount !== 1) {
+          throw new OrderRequestError(409, 'An item in your cart no longer has enough stock. Please review your cart.');
+        }
+      }
+
+      const subtotal = money(orderItems.reduce((sum, item) => sum + item.lineTotal, 0));
+      const deliveryFee = DELIVERY_FEES[deliveryArea];
+      const now = new Date();
+      const stamp = now.toISOString().slice(2, 10).replaceAll('-', '');
+      const orderId = `NS-${stamp}-${randomBytes(4).toString('hex').toUpperCase()}`;
+
+      savedOrder = {
+        orderId,
+        customer,
+        items: orderItems,
+        deliveryArea,
+        deliveryFee,
+        subtotal,
+        total: money(subtotal + deliveryFee),
+        paymentMethod: 'Cash on Delivery',
+        status: 'pending',
+        createdAt: now,
+        updatedAt: now,
+      };
+      await orders.insertOne(savedOrder, { session });
+    });
+
+    return res.status(201).json({
+      data: {
+        orderId: savedOrder.orderId,
+        status: savedOrder.status,
+        total: savedOrder.total,
+      },
+    });
+  } catch (error) {
+    if (error instanceof OrderRequestError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    if (error?.code === 11000) {
+      return res.status(409).json({ error: 'Could not create a unique order ID. Please try again.' });
+    }
+    console.error('Order creation failed:', error);
+    return res.status(500).json({ error: 'Could not place your order. Please try again.' });
+  } finally {
+    await session?.endSession();
+  }
+});
+
 
 // --- NEW: used by the dashboard's "Add product" page -----------------------
 // PLACEHOLDER — no admin/auth check yet. Before this ships, gate it behind
@@ -452,285 +737,23 @@ app.delete('/admin/products/:id', async (req, res) => {
   }
 });
 
-const DELIVERY_FEES = Object.freeze({
-  'inside-dhaka': 70,
-  'outside-dhaka': 120,
-});
-const MAX_ORDER_LINES = 30;
-const MAX_QUANTITY_PER_LINE = 20;
-const MAX_PATCHES_PER_LINE = 4;
-const orderRateBuckets = new Map();
 
-class OrderRequestError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
 
-function requiredText(value, label, maxLength, minLength = 1) {
-  if (typeof value !== 'string') {
-    throw new OrderRequestError(400, `${label} must be text.`);
-  }
-  const normalized = value.trim();
-  if (normalized.length < minLength || normalized.length > maxLength) {
-    throw new OrderRequestError(400, `${label} must be between ${minLength} and ${maxLength} characters.`);
-  }
-  return normalized;
-}
-
-function optionalText(value, label, maxLength) {
-  if (value === undefined || value === null || value === '') return '';
-  return requiredText(value, label, maxLength, 0);
-}
-
-function limitOrderRequests(req, res, next) {
-  const now = Date.now();
-  const key = req.ip || req.socket.remoteAddress || 'unknown';
-  const windowMs = 10 * 60 * 1000;
-  const maxRequests = 8;
-  let bucket = orderRateBuckets.get(key);
-
-  if (!bucket || bucket.resetAt <= now) {
-    bucket = { count: 0, resetAt: now + windowMs };
-    orderRateBuckets.set(key, bucket);
-  }
-  bucket.count += 1;
-
-  if (bucket.count > maxRequests) {
-    res.set('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
-    return res.status(429).json({ error: 'Too many order attempts. Please try again shortly.' });
-  }
-  return next();
-}
-
-function findPricedOption(options, image, label) {
-  if (!Array.isArray(options)) {
-    throw new OrderRequestError(409, `${label} options are no longer available.`);
-  }
-  const found = options.find((entry) => (typeof entry === 'string' ? entry : entry?.image) === image);
-  if (!found) throw new OrderRequestError(400, `The selected ${label.toLowerCase()} is invalid.`);
-
-  const price = typeof found === 'string' ? 0 : Number(found.price);
-  if (!Number.isFinite(price) || price < 0) {
-    throw new OrderRequestError(409, `The selected ${label.toLowerCase()} has an invalid price.`);
-  }
-  return { image, price };
-}
-
-function money(value) {
-  return Math.round((value + Number.EPSILON) * 100) / 100;
-}
-
-app.post('/orders', limitOrderRequests, async (req, res) => {
-  if (!products || !orders) {
-    return res.status(503).json({ error: 'Order service is not ready.' });
+app.get('/admin/orders', async (req, res) => {
+  if (!orders) {
+    return res.status(503).json({ error: 'Database not connected yet' });
   }
 
-  let session;
   try {
-    const body = req.body;
-    if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      throw new OrderRequestError(400, 'A valid order body is required.');
-    }
+    const result = await orders
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
 
-    const customerInput = body.customer;
-    if (!customerInput || typeof customerInput !== 'object' || Array.isArray(customerInput)) {
-      throw new OrderRequestError(400, 'Customer details are required.');
-    }
-
-    const customer = {
-      name: requiredText(customerInput.name, 'Name', 100),
-      address: requiredText(customerInput.address, 'Address', 500, 5),
-      phone: requiredText(customerInput.phone, 'Phone number', 11),
-      phone2: optionalText(customerInput.phone2, 'Alternate phone number', 11),
-      note: optionalText(customerInput.note, 'Order note', 1000),
-    };
-    if (!/^01[3-9]\d{8}$/.test(customer.phone)) {
-      throw new OrderRequestError(400, 'Enter a valid 11-digit phone number.');
-    }
-    if (customer.phone2 && !/^01[3-9]\d{8}$/.test(customer.phone2)) {
-      throw new OrderRequestError(400, 'Enter a valid alternate phone number.');
-    }
-
-    const deliveryArea = body.deliveryArea;
-    if (!Object.hasOwn(DELIVERY_FEES, deliveryArea)) {
-      throw new OrderRequestError(400, 'Choose a valid delivery area.');
-    }
-
-    if (!Array.isArray(body.items) || body.items.length === 0 || body.items.length > MAX_ORDER_LINES) {
-      throw new OrderRequestError(400, `An order must contain between 1 and ${MAX_ORDER_LINES} items.`);
-    }
-
-    const requestedItems = body.items.map((input, index) => {
-      if (!input || typeof input !== 'object' || Array.isArray(input)) {
-        throw new OrderRequestError(400, `Item ${index + 1} is invalid.`);
-      }
-      if (typeof input.productId !== 'string' || !/^[a-f\d]{24}$/i.test(input.productId)) {
-        throw new OrderRequestError(400, `Item ${index + 1} has an invalid product ID.`);
-      }
-      if (!Number.isSafeInteger(input.quantity) || input.quantity < 1 || input.quantity > MAX_QUANTITY_PER_LINE) {
-        throw new OrderRequestError(400, `Item ${index + 1} quantity must be between 1 and ${MAX_QUANTITY_PER_LINE}.`);
-      }
-
-      const size = requiredText(input.size, `Item ${index + 1} size`, 12);
-      const customization = input.customization ?? {};
-      if (typeof customization !== 'object' || Array.isArray(customization)) {
-        throw new OrderRequestError(400, `Item ${index + 1} customization is invalid.`);
-      }
-
-      const customName = optionalText(customization.name, `Item ${index + 1} name`, 14).toUpperCase();
-      const customNumber = optionalText(customization.number, `Item ${index + 1} number`, 2);
-      if (customNumber && !/^\d{1,2}$/.test(customNumber)) {
-        throw new OrderRequestError(400, `Item ${index + 1} number must contain up to two digits.`);
-      }
-      const fontImage = customization.fontImage === undefined || customization.fontImage === ''
-        ? ''
-        : requiredText(customization.fontImage, `Item ${index + 1} font image`, 2048);
-      if (!fontImage && (customName || customNumber)) {
-        throw new OrderRequestError(400, `Choose a font before adding name or number to item ${index + 1}.`);
-      }
-
-      if (input.patches !== undefined && !Array.isArray(input.patches)) {
-        throw new OrderRequestError(400, `Item ${index + 1} patches must be a list.`);
-      }
-      const patches = input.patches ?? [];
-      if (patches.length > MAX_PATCHES_PER_LINE || patches.some((patch) => typeof patch !== 'string' || patch.length > 2048)) {
-        throw new OrderRequestError(400, `Item ${index + 1} has invalid patch selections.`);
-      }
-      if (new Set(patches).size !== patches.length) {
-        throw new OrderRequestError(400, `Item ${index + 1} contains a duplicate patch.`);
-      }
-
-      return {
-        productId: new ObjectId(input.productId),
-        quantity: input.quantity,
-        size,
-        customName,
-        customNumber,
-        fontImage,
-        patches,
-      };
-    });
-
-    session = client.startSession();
-    let savedOrder;
-
-    await session.withTransaction(async () => {
-      const productCache = new Map();
-      const stockDemand = new Map();
-      const orderItems = [];
-
-      for (const input of requestedItems) {
-        const productId = input.productId.toHexString();
-        let product = productCache.get(productId);
-        if (!product) {
-          product = await products.findOne({ _id: input.productId }, { session });
-          if (!product) throw new OrderRequestError(404, 'A product in your cart no longer exists.');
-          productCache.set(productId, product);
-        }
-
-        if (!Array.isArray(product.size) || !product.size.includes(input.size)) {
-          throw new OrderRequestError(400, `${product.title} does not have size ${input.size}.`);
-        }
-
-        const basePrice = Number(product.price);
-        if (!Number.isFinite(basePrice) || basePrice < 0) {
-          throw new OrderRequestError(409, `${product.title} has an invalid price.`);
-        }
-
-        let font = null;
-        if (input.fontImage) {
-          if (product.font !== true) throw new OrderRequestError(400, `${product.title} does not offer custom fonts.`);
-          font = findPricedOption(product.fontsImg, input.fontImage, 'Font');
-        }
-
-        if ((input.customName || input.customNumber) && !font) {
-          throw new OrderRequestError(400, `Select a font for ${product.title} before entering name or number.`);
-        }
-
-        if (input.patches.length && product.patch !== true) {
-          throw new OrderRequestError(400, `${product.title} does not offer patches.`);
-        }
-        const patches = input.patches.map((image) => findPricedOption(product.patchsImg, image, 'Patch'));
-        const optionsPrice = (font?.price ?? 0) + patches.reduce((sum, patch) => sum + patch.price, 0);
-        const unitPrice = money(basePrice + optionsPrice);
-        const originalBasePrice = product.discount === true ? Number(product.beforePrice) : 0;
-        const originalUnitPrice = Number.isFinite(originalBasePrice) && originalBasePrice > basePrice
-          ? money(originalBasePrice + optionsPrice)
-          : null;
-
-        stockDemand.set(productId, (stockDemand.get(productId) ?? 0) + input.quantity);
-        orderItems.push({
-          productId: input.productId,
-          title: product.title,
-          image: product.imagesLink?.[0] ?? '',
-          size: input.size,
-          quantity: input.quantity,
-          basePrice: money(basePrice),
-          font,
-          patches,
-          customization: {
-            name: input.customName,
-            number: input.customNumber,
-          },
-          unitPrice,
-          originalUnitPrice,
-          lineTotal: money(unitPrice * input.quantity),
-        });
-      }
-
-      for (const [productId, quantity] of stockDemand) {
-        const result = await products.updateOne(
-          { _id: new ObjectId(productId), stock: { $gte: quantity } },
-          { $inc: { stock: -quantity } },
-          { session }
-        );
-        if (result.matchedCount !== 1) {
-          throw new OrderRequestError(409, 'An item in your cart no longer has enough stock. Please review your cart.');
-        }
-      }
-
-      const subtotal = money(orderItems.reduce((sum, item) => sum + item.lineTotal, 0));
-      const deliveryFee = DELIVERY_FEES[deliveryArea];
-      const now = new Date();
-      const stamp = now.toISOString().slice(2, 10).replaceAll('-', '');
-      const orderId = `NS-${stamp}-${randomBytes(4).toString('hex').toUpperCase()}`;
-
-      savedOrder = {
-        orderId,
-        customer,
-        items: orderItems,
-        deliveryArea,
-        deliveryFee,
-        subtotal,
-        total: money(subtotal + deliveryFee),
-        paymentMethod: 'Cash on Delivery',
-        status: 'pending',
-        createdAt: now,
-        updatedAt: now,
-      };
-      await orders.insertOne(savedOrder, { session });
-    });
-
-    return res.status(201).json({
-      data: {
-        orderId: savedOrder.orderId,
-        status: savedOrder.status,
-        total: savedOrder.total,
-      },
-    });
-  } catch (error) {
-    if (error instanceof OrderRequestError) {
-      return res.status(error.status).json({ error: error.message });
-    }
-    if (error?.code === 11000) {
-      return res.status(409).json({ error: 'Could not create a unique order ID. Please try again.' });
-    }
-    console.error('Order creation failed:', error);
-    return res.status(500).json({ error: 'Could not place your order. Please try again.' });
-  } finally {
-    await session?.endSession();
+    return res.status(200).json({ data: result });
+  } catch (err) {
+    console.error('Failed to load admin orders:', err);
+    return res.status(500).json({ error: 'Could not load orders.' });
   }
 });
 
