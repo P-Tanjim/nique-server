@@ -3,6 +3,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const { randomBytes } = require('node:crypto');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const { requireAdminKey, createAdminDashboardRouter } = require('./adminDashboard');
 
 dotenv.config();
 
@@ -11,6 +12,7 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
+app.use('/admin', requireAdminKey);
 
 
 function requiredText(value, label, maxLength, minLength = 1) {
@@ -76,6 +78,8 @@ const client = new MongoClient(uri, {
 let products; // filled in once connected
 let testimonials;
 let orders;
+let financeTx;
+let financeSettings;
 
 async function connectDB() {
   await client.connect();
@@ -83,6 +87,9 @@ async function connectDB() {
   products = database.collection("products");
   testimonials = database.collection("testimonials")
   orders = database.collection('orders');
+  financeTx = database.collection('finance_transactions');
+  financeSettings = database.collection('finance_settings');
+  await financeTx.createIndex({ date: -1, createdAt: -1 });
   await orders.createIndex({ orderId: 1 }, { unique: true });
   console.log("MongoDB connected");
 }
@@ -153,7 +160,7 @@ app.get('/products', async (req, res) => {
     const skip = parseInt(req.query.skip) || 0;
     const result = await products.find({}).skip(skip).limit(limit).toArray()
 
-      res.status(200).json({ data: result });
+    res.status(200).json({ data: result });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Something went wrong." });
@@ -526,7 +533,7 @@ app.post('/admin/products', async (req, res) => {
       fontsImg: fontOptions.value,
       createdAt: new Date(),
     };
-    
+
     const result = await products.insertOne(doc);
     return res.status(201).json({ data: { _id: result.insertedId, ...doc } });
   } catch (err) {
@@ -539,7 +546,7 @@ app.get('/admin/feature-count', async (req, res) => {
   if (!products) return res.status(503).json({ error: 'Database not connected yet' });
 
   try {
-    const result = await products.countDocuments({featured: true})
+    const result = await products.countDocuments({ featured: true })
 
     res.status(200).json({ data: result });
   } catch (err) {
@@ -804,4 +811,5 @@ app.put('/admin/orders/:id/status', async (req, res) => {
   }
 });
 
+app.use('/admin', createAdminDashboardRouter(() => ({ products, orders, financeTx, financeSettings })));
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
