@@ -813,3 +813,6 @@ app.put('/admin/orders/:id/status', async (req, res) => {
 
 app.use('/admin', createAdminDashboardRouter(() => ({ products, orders, financeTx, financeSettings })));
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+
+
+module.exports = app;
