@@ -1,818 +1,231 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const { randomBytes } = require('node:crypto');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const { requireAdminKey, createAdminDashboardRouter } = require('./adminDashboard');
+const { requireAdminKey } = require('./adminAuth');
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
+app.disable('x-powered-by');
+// Set ALLOWED_ORIGINS="https://yourshop.com,https://www.yourshop.com" in production.
+// (Admin routes are protected by the secret key anyway; this just stops random sites calling the public routes from a browser.)
+const origins = (process.env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+app.use(cors(origins.length ? { origin: origins } : undefined));
+app.use(express.json({ limit: '1mb' }));
 app.use('/admin', requireAdminKey);
 
+/* ------------------------------- helpers ------------------------------- */
 
-function requiredText(value, label, maxLength, minLength = 1) {
-  if (typeof value !== 'string') {
-    throw new OrderRequestError(400, `${label} must be text.`);
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+const bad = (msg) => { throw new HttpError(400, msg); };
+const wrap = (fn) => async (req, res) => {
+  try { await fn(req, res); } catch (err) {
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
+    console.error(`${req.method} ${req.originalUrl} failed:`, err);
+    return res.status(500).json({ error: 'Something went wrong.' });
   }
-  const normalized = value.trim();
-  if (normalized.length < minLength || normalized.length > maxLength) {
-    throw new OrderRequestError(400, `${label} must be between ${minLength} and ${maxLength} characters.`);
-  }
-  return normalized;
+};
+const needDb = (req, res, next) => (products ? next() : res.status(503).json({ error: 'Database not connected yet' }));
+const objectId = (value, label = 'id') => {
+  if (typeof value !== 'string' || !/^[a-f\d]{24}$/i.test(value)) bad(`Invalid ${label}.`);
+  return new ObjectId(value);
+};
+
+const SIZES = ['S', 'M', 'L', 'XL', 'XXL', 'XXXL'];
+const isUrl = (s) => typeof s === 'string' && s.length <= 2048 && /^https?:\/\/\S+$/i.test(s.trim());
+const str = (v, label, max, { required = false } = {}) => {
+  if (v === undefined || v === null || v === '') { if (required) bad(`${label} is required.`); return ''; }
+  if (typeof v !== 'string') bad(`${label} must be text.`);
+  const s = v.trim();
+  if (required && !s) bad(`${label} is required.`);
+  if (s.length > max) bad(`${label} must be ${max} characters or fewer.`);
+  return s;
+};
+const num = (v, label, { min = 0, max = 10_000_000, int = false } = {}) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < min || n > max || (int && !Number.isInteger(n))) bad(`${label} must be a valid number${int ? ' (whole)' : ''} between ${min} and ${max}.`);
+  return n;
+};
+
+function pricedImages(items, label, max = 8) {
+  if (!Array.isArray(items)) bad(`${label} must be an array.`);
+  if (items.length > max) bad(`${label}: at most ${max} options.`);
+  return items.map((item, i) => {
+    const legacy = typeof item === 'string';
+    const image = legacy ? item : item?.image;
+    if (!isUrl(image)) bad(`${label} option ${i + 1} must have a valid image URL.`);
+    const raw = legacy ? 0 : item?.price;
+    if (raw === undefined || raw === null || raw === '') bad(`${label} option ${i + 1} needs a price.`);
+    return { image: image.trim(), price: num(raw, `${label} option ${i + 1} price`, { max: 1_000_000 }) };
+  });
 }
 
-function optionalText(value, label, maxLength) {
-  if (value === undefined || value === null || value === '') return '';
-  return requiredText(value, label, maxLength, 0);
+// ONE validator for create + update (they used to be copy-pasted)
+function validateProduct(body = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) bad('A valid product body is required.');
+  const title = str(body.title, 'Title', 200, { required: true });
+  const category = str(body.category, 'Category', 80, { required: true });
+  const price = num(body.price, 'Price', { max: 1_000_000 });
+  const stock = num(body.stock ?? 0, 'Stock', { max: 1_000_000, int: true });
+
+  if (!Array.isArray(body.size) || body.size.length === 0 || body.size.some((s) => !SIZES.includes(s))) bad(`Select at least one valid size (${SIZES.join(', ')}).`);
+  const size = [...new Set(body.size)];
+
+  const discount = Boolean(body.discount);
+  const beforePrice = discount ? num(body.beforePrice, 'Before price', { max: 1_000_000 }) : 0;
+  if (discount && beforePrice <= price) bad('Before price must be greater than the selling price.');
+
+  const imagesLink = body.imagesLink;
+  if (!Array.isArray(imagesLink) || imagesLink.length === 0 || imagesLink.length > 15 || !imagesLink.every(isUrl)) bad('Add 1-15 valid product images.');
+
+  const patch = Boolean(body.patch);
+  const font = Boolean(body.font);
+  const patchsImg = patch ? pricedImages(body.patchsImg ?? [], 'Patch', 4) : [];
+  const fontsImg = font ? pricedImages(body.fontsImg ?? [], 'Font', 4) : [];
+  if (patch && !patchsImg.length) bad('Patch is enabled but no patch options were provided.');
+  if (font && !fontsImg.length) bad('Font is enabled but no font options were provided.');
+
+  return {
+    title, desc: str(body.desc, 'Description', 5000), price, discount, beforePrice,
+    discountPercent: discount ? Math.round(((beforePrice - price) / beforePrice) * 100) : 0,
+    size, patch, font, featured: Boolean(body.featured), stock,
+    team: str(body.team, 'Team', 80), seassion: str(body.seassion, 'Season', 20), category,
+    imagesLink: imagesLink.map((s) => s.trim()), patchsImg, fontsImg,
+  };
 }
 
-function limitOrderRequests(req, res, next) {
-  const now = Date.now();
-  const key = req.ip || req.socket.remoteAddress || 'unknown';
-  const windowMs = 10 * 60 * 1000;
-  const maxRequests = 8;
-  let bucket = orderRateBuckets.get(key);
+/* ------------------------------- database ------------------------------- */
 
-  if (!bucket || bucket.resetAt <= now) {
-    bucket = { count: 0, resetAt: now + windowMs };
-    orderRateBuckets.set(key, bucket);
-  }
-  bucket.count += 1;
-
-  if (bucket.count > maxRequests) {
-    res.set('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
-    return res.status(429).json({ error: 'Too many order attempts. Please try again shortly.' });
-  }
-  return next();
-}
-
-function findPricedOption(options, image, label) {
-  if (!Array.isArray(options)) {
-    throw new OrderRequestError(409, `${label} options are no longer available.`);
-  }
-  const found = options.find((entry) => (typeof entry === 'string' ? entry : entry?.image) === image);
-  if (!found) throw new OrderRequestError(400, `The selected ${label.toLowerCase()} is invalid.`);
-
-  const price = typeof found === 'string' ? 0 : Number(found.price);
-  if (!Number.isFinite(price) || price < 0) {
-    throw new OrderRequestError(409, `The selected ${label.toLowerCase()} has an invalid price.`);
-  }
-  return { image, price };
-}
-
-function money(value) {
-  return Math.round((value + Number.EPSILON) * 100) / 100;
-}
-
-
-const uri = process.env.MONGODB_URL;
-const client = new MongoClient(uri, {
+const client = new MongoClient(process.env.MONGODB_URL, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
-
-let products; // filled in once connected
+let products;
 let testimonials;
-let orders;
-let financeTx;
-let financeSettings;
 
 async function connectDB() {
   await client.connect();
   const database = client.db('nique_sports');
-  products = database.collection("products");
-  testimonials = database.collection("testimonials")
-  orders = database.collection('orders');
-  financeTx = database.collection('finance_transactions');
-  financeSettings = database.collection('finance_settings');
-  await financeTx.createIndex({ date: -1, createdAt: -1 });
-  await orders.createIndex({ orderId: 1 }, { unique: true });
-  console.log("MongoDB connected");
+  products = database.collection('products');
+  testimonials = database.collection('testimonials');
+  console.log('MongoDB connected');
 }
-connectDB().catch((err) => console.error("Mongo connection failed:", err));
+connectDB().catch((err) => console.error('Mongo connection failed:', err));
 
-// Routes are always registered, no matter what happens above
+/* ------------------------------- public routes ------------------------------- */
+
 app.get('/', (req, res) => res.send('Hello World!'));
 app.get('/hi', (req, res) => res.send('hi'));
 
-app.get('/featured-products', async (req, res) => {
-  if (!products) return res.status(503).json({ error: 'Database not connected yet' });
+app.get('/featured-products', needDb, wrap(async (req, res) => {
+  const data = await products.aggregate([
+    { $match: { featured: true } },
+    { $project: { title: 1, imageLink: { $arrayElemAt: ['$imagesLink', 0] } } },
+  ]).toArray();
+  res.status(200).json({ data });
+}));
 
-  try {
-    const result = await products.aggregate([
-      {
-        $match: {
-          featured: true
-        }
-      },
-      {
-        $project: {
-          title: 1,
-          imageLink: { $arrayElemAt: ['$imagesLink', 0] }
-        }
-      }
-    ]).toArray();
-    res.status(200).json({ data: result });
+app.get('/products/:id', needDb, wrap(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(400).json({ data: null });
+  const product = await products.findOne({ _id: new ObjectId(req.params.id) });
+  if (!product) return res.status(404).json({ data: null });
+  return res.status(200).json({ data: product });
+}));
+
+app.get('/testimonials', wrap(async (req, res) => {
+  if (!testimonials) return res.status(503).json({ error: 'Database not connected' });
+  const data = await testimonials.find({}).sort({ createdAt: -1 }).limit(20).toArray();
+  res.status(200).json({ data });
+}));
+
+app.get('/products', needDb, wrap(async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 1000);
+  const skip = Math.max(parseInt(req.query.skip, 10) || 0, 0);
+  const data = await products.find({}).skip(skip).limit(limit).toArray();
+  res.status(200).json({ data });
+}));
+
+/* ------------------------------- admin: products ------------------------------- */
+
+app.post('/admin/products', needDb, wrap(async (req, res) => {
+  const doc = { ...validateProduct(req.body), createdAt: new Date() };
+  const result = await products.insertOne(doc);
+  res.status(201).json({ data: { _id: result.insertedId, ...doc } });
+}));
+
+app.put('/admin/products/:id', needDb, wrap(async (req, res) => {
+  const _id = objectId(req.params.id, 'product id');
+  const doc = { ...validateProduct(req.body), updatedAt: new Date() };
+  const result = await products.updateOne({ _id }, { $set: doc });
+  if (result.matchedCount === 0) throw new HttpError(404, 'Product not found.');
+  res.status(200).json({ data: { _id, ...doc } });
+}));
+
+app.delete('/admin/products/:id', needDb, wrap(async (req, res) => {
+  const result = await products.deleteOne({ _id: objectId(req.params.id, 'product id') });
+  if (result.deletedCount === 0) throw new HttpError(404, 'Product not found.');
+  res.status(200).json({ data: { _id: req.params.id } });
+}));
+
+app.get('/admin/feature-count', needDb, wrap(async (req, res) => {
+  res.status(200).json({ data: await products.countDocuments({ featured: true }) });
+}));
+
+// Dashboard "Running low" card (orders moved to the sheet, stock stays here)
+app.get('/admin/low-stock', needDb, wrap(async (req, res) => {
+  const threshold = Math.min(Math.max(parseInt(req.query.threshold, 10) || 5, 0), 1000);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 50);
+  const filter = { stock: { $lte: threshold } };
+  const [items, total] = await Promise.all([
+    products.find(filter, { projection: { title: 1, stock: 1, imagesLink: { $slice: 1 } } }).sort({ stock: 1, title: 1 }).limit(limit).toArray(),
+    products.countDocuments(filter),
+  ]);
+  res.status(200).json({
+    data: { threshold, total, items: items.map((p) => ({ id: String(p._id), title: p.title ?? 'Untitled product', stock: Number(p.stock) || 0, image: p.imagesLink?.[0] ?? null })) },
+  });
+}));
+
+/* ------------------------------- admin: stock (called by the website checkout) ------------------------------- */
+
+function stockLines(body) {
+  const items = body?.items;
+  if (!Array.isArray(items) || items.length < 1 || items.length > 50) bad('items must be a list of 1-50 lines.');
+  const totals = new Map();
+  for (const it of items) {
+    const id = objectId(it?.productId, 'productId').toHexString();
+    const q = Number(it?.quantity);
+    if (!Number.isInteger(q) || q < 1 || q > 100) bad('quantity must be a whole number between 1 and 100.');
+    totals.set(id, (totals.get(id) ?? 0) + q);
   }
-  catch (err) {
-    res.status(500).json({ message: "Something Went Wrong." })
-  }
-
-});
-
-app.get('/products/:id', async (req, res) => {
-  try {
-    const product = await products.findOne({ _id: new ObjectId(req.params.id) });
-    if (!product) return res.status(404).json({ data: null });
-    res.status(200).json({ data: product });
-  } catch (err) {
-    res.status(400).json({ data: null });
-  }
-});
-
-app.get('/testimonials', async (req, res) => {
-  if (!client) return res.status(503).json({ error: 'Database not connected' });
-
-  try {
-    // Fetch top 20 latest reviews
-    const result = await testimonials
-      .find({})
-      .sort({ createdAt: -1 })
-      .limit(20)
-      .toArray();
-
-    res.status(200).json({ data: result });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
-  }
-});
-
-app.get('/products', async (req, res) => {
-  if (!products) return res.status(503).json({ error: 'Database not connected yet' });
-
-  try {
-    const limit = parseInt(req.query.limit)
-    const skip = parseInt(req.query.skip) || 0;
-    const result = await products.find({}).skip(skip).limit(limit).toArray()
-
-    res.status(200).json({ data: result });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
-  }
-
-})
-
-const DELIVERY_FEES = Object.freeze({
-  'inside-dhaka': 70,
-  'outside-dhaka': 120,
-});
-const MAX_ORDER_LINES = 30;
-const MAX_QUANTITY_PER_LINE = 20;
-const MAX_PATCHES_PER_LINE = 4;
-const orderRateBuckets = new Map();
-
-class OrderRequestError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
+  return totals;
 }
 
-app.post('/orders', limitOrderRequests, async (req, res) => {
-  if (!products || !orders) {
-    return res.status(503).json({ error: 'Order service is not ready.' });
-  }
-
-  let session;
+// All-or-nothing: either every line has enough stock and is decremented, or nothing changes.
+app.post('/admin/stock/decrement', needDb, wrap(async (req, res) => {
+  const totals = stockLines(req.body);
+  const session = client.startSession();
   try {
-    const body = req.body;
-    if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      throw new OrderRequestError(400, 'A valid order body is required.');
-    }
-
-    const customerInput = body.customer;
-    if (!customerInput || typeof customerInput !== 'object' || Array.isArray(customerInput)) {
-      throw new OrderRequestError(400, 'Customer details are required.');
-    }
-
-    const customer = {
-      name: requiredText(customerInput.name, 'Name', 100),
-      address: requiredText(customerInput.address, 'Address', 500, 5),
-      phone: requiredText(customerInput.phone, 'Phone number', 11),
-      phone2: optionalText(customerInput.phone2, 'Alternate phone number', 11),
-      note: optionalText(customerInput.note, 'Order note', 1000),
-    };
-    if (!/^01[3-9]\d{8}$/.test(customer.phone)) {
-      throw new OrderRequestError(400, 'Enter a valid 11-digit phone number.');
-    }
-    if (customer.phone2 && !/^01[3-9]\d{8}$/.test(customer.phone2)) {
-      throw new OrderRequestError(400, 'Enter a valid alternate phone number.');
-    }
-
-    const deliveryArea = body.deliveryArea;
-    if (!Object.hasOwn(DELIVERY_FEES, deliveryArea)) {
-      throw new OrderRequestError(400, 'Choose a valid delivery area.');
-    }
-
-    if (!Array.isArray(body.items) || body.items.length === 0 || body.items.length > MAX_ORDER_LINES) {
-      throw new OrderRequestError(400, `An order must contain between 1 and ${MAX_ORDER_LINES} items.`);
-    }
-
-    const requestedItems = body.items.map((input, index) => {
-      if (!input || typeof input !== 'object' || Array.isArray(input)) {
-        throw new OrderRequestError(400, `Item ${index + 1} is invalid.`);
-      }
-      if (typeof input.productId !== 'string' || !/^[a-f\d]{24}$/i.test(input.productId)) {
-        throw new OrderRequestError(400, `Item ${index + 1} has an invalid product ID.`);
-      }
-      if (!Number.isSafeInteger(input.quantity) || input.quantity < 1 || input.quantity > MAX_QUANTITY_PER_LINE) {
-        throw new OrderRequestError(400, `Item ${index + 1} quantity must be between 1 and ${MAX_QUANTITY_PER_LINE}.`);
-      }
-
-      const size = requiredText(input.size, `Item ${index + 1} size`, 12);
-      const customization = input.customization ?? {};
-      if (typeof customization !== 'object' || Array.isArray(customization)) {
-        throw new OrderRequestError(400, `Item ${index + 1} customization is invalid.`);
-      }
-
-      const customName = optionalText(customization.name, `Item ${index + 1} name`, 14).toUpperCase();
-      const customNumber = optionalText(customization.number, `Item ${index + 1} number`, 2);
-      if (customNumber && !/^\d{1,2}$/.test(customNumber)) {
-        throw new OrderRequestError(400, `Item ${index + 1} number must contain up to two digits.`);
-      }
-      const fontImage = customization.fontImage === undefined || customization.fontImage === ''
-        ? ''
-        : requiredText(customization.fontImage, `Item ${index + 1} font image`, 2048);
-      if (!fontImage && (customName || customNumber)) {
-        throw new OrderRequestError(400, `Choose a font before adding name or number to item ${index + 1}.`);
-      }
-
-      if (input.patches !== undefined && !Array.isArray(input.patches)) {
-        throw new OrderRequestError(400, `Item ${index + 1} patches must be a list.`);
-      }
-      const patches = input.patches ?? [];
-      if (patches.length > MAX_PATCHES_PER_LINE || patches.some((patch) => typeof patch !== 'string' || patch.length > 2048)) {
-        throw new OrderRequestError(400, `Item ${index + 1} has invalid patch selections.`);
-      }
-      if (new Set(patches).size !== patches.length) {
-        throw new OrderRequestError(400, `Item ${index + 1} contains a duplicate patch.`);
-      }
-
-      return {
-        productId: new ObjectId(input.productId),
-        quantity: input.quantity,
-        size,
-        customName,
-        customNumber,
-        fontImage,
-        patches,
-      };
-    });
-
-    session = client.startSession();
-    let savedOrder;
-
     await session.withTransaction(async () => {
-      const productCache = new Map();
-      const stockDemand = new Map();
-      const orderItems = [];
-
-      for (const input of requestedItems) {
-        const productId = input.productId.toHexString();
-        let product = productCache.get(productId);
-        if (!product) {
-          product = await products.findOne({ _id: input.productId }, { session });
-          if (!product) throw new OrderRequestError(404, 'A product in your cart no longer exists.');
-          productCache.set(productId, product);
-        }
-
-        if (!Array.isArray(product.size) || !product.size.includes(input.size)) {
-          throw new OrderRequestError(400, `${product.title} does not have size ${input.size}.`);
-        }
-
-        const basePrice = Number(product.price);
-        if (!Number.isFinite(basePrice) || basePrice < 0) {
-          throw new OrderRequestError(409, `${product.title} has an invalid price.`);
-        }
-
-        let font = null;
-        if (input.fontImage) {
-          if (product.font !== true) throw new OrderRequestError(400, `${product.title} does not offer custom fonts.`);
-          font = findPricedOption(product.fontsImg, input.fontImage, 'Font');
-        }
-
-        if ((input.customName || input.customNumber) && !font) {
-          throw new OrderRequestError(400, `Select a font for ${product.title} before entering name or number.`);
-        }
-
-        if (input.patches.length && product.patch !== true) {
-          throw new OrderRequestError(400, `${product.title} does not offer patches.`);
-        }
-        const patches = input.patches.map((image) => findPricedOption(product.patchsImg, image, 'Patch'));
-        const optionsPrice = (font?.price ?? 0) + patches.reduce((sum, patch) => sum + patch.price, 0);
-        const unitPrice = money(basePrice + optionsPrice);
-        const originalBasePrice = product.discount === true ? Number(product.beforePrice) : 0;
-        const originalUnitPrice = Number.isFinite(originalBasePrice) && originalBasePrice > basePrice
-          ? money(originalBasePrice + optionsPrice)
-          : null;
-
-        stockDemand.set(productId, (stockDemand.get(productId) ?? 0) + input.quantity);
-        orderItems.push({
-          productId: input.productId,
-          title: product.title,
-          image: product.imagesLink?.[0] ?? '',
-          size: input.size,
-          quantity: input.quantity,
-          basePrice: money(basePrice),
-          font,
-          patches,
-          customization: {
-            name: input.customName,
-            number: input.customNumber,
-          },
-          unitPrice,
-          originalUnitPrice,
-          lineTotal: money(unitPrice * input.quantity),
-        });
+      for (const [id, qty] of totals) {
+        const r = await products.updateOne({ _id: new ObjectId(id), stock: { $gte: qty } }, { $inc: { stock: -qty } }, { session });
+        if (r.matchedCount !== 1) throw new HttpError(409, 'An item in your cart no longer has enough stock. Please review your cart.');
       }
-
-      for (const [productId, quantity] of stockDemand) {
-        const result = await products.updateOne(
-          { _id: new ObjectId(productId), stock: { $gte: quantity } },
-          { $inc: { stock: -quantity } },
-          { session }
-        );
-        if (result.matchedCount !== 1) {
-          throw new OrderRequestError(409, 'An item in your cart no longer has enough stock. Please review your cart.');
-        }
-      }
-
-      const subtotal = money(orderItems.reduce((sum, item) => sum + item.lineTotal, 0));
-      const deliveryFee = DELIVERY_FEES[deliveryArea];
-      const now = new Date();
-      const stamp = now.toISOString().slice(2, 10).replaceAll('-', '');
-      const orderId = `NS-${stamp}-${randomBytes(4).toString('hex').toUpperCase()}`;
-
-      savedOrder = {
-        orderId,
-        customer,
-        items: orderItems,
-        deliveryArea,
-        deliveryFee,
-        subtotal,
-        total: money(subtotal + deliveryFee),
-        paymentMethod: 'Cash on Delivery',
-        status: 'pending',
-        createdAt: now,
-        updatedAt: now,
-      };
-      await orders.insertOne(savedOrder, { session });
     });
-
-    return res.status(201).json({
-      data: {
-        orderId: savedOrder.orderId,
-        status: savedOrder.status,
-        total: savedOrder.total,
-      },
-    });
-  } catch (error) {
-    if (error instanceof OrderRequestError) {
-      return res.status(error.status).json({ error: error.message });
-    }
-    if (error?.code === 11000) {
-      return res.status(409).json({ error: 'Could not create a unique order ID. Please try again.' });
-    }
-    console.error('Order creation failed:', error);
-    return res.status(500).json({ error: 'Could not place your order. Please try again.' });
   } finally {
-    await session?.endSession();
+    await session.endSession();
   }
-});
+  res.status(200).json({ data: { ok: true } });
+}));
+
+// Used only to undo a decrement when saving the order fails.
+app.post('/admin/stock/restock', needDb, wrap(async (req, res) => {
+  const totals = stockLines(req.body);
+  await products.bulkWrite([...totals].map(([id, qty]) => ({ updateOne: { filter: { _id: new ObjectId(id) }, update: { $inc: { stock: qty } } } })));
+  res.status(200).json({ data: { ok: true } });
+}));
 
-
-// --- NEW: used by the dashboard's "Add product" page -----------------------
-// PLACEHOLDER — no admin/auth check yet. Before this ships, gate it behind
-// whatever session/isAdmin check you use elsewhere, or anyone who finds
-// this URL can insert products.
-app.post('/admin/products', async (req, res) => {
-  if (!products) {
-    return res.status(503).json({ error: 'Database not connected yet' });
-  }
-
-  try {
-    const {
-      title,
-      desc,
-      price,
-      size = [],
-      patch = false,
-      font = false,
-      featured = false,
-      discount = false,
-      beforePrice,
-      stock,
-      team,
-      seassion,
-      category,
-      imagesLink = [],
-      patchsImg = [],
-      fontsImg = [],
-    } = req.body ?? {};
-
-    if (!title?.trim() || price === undefined || price === null || !category?.trim()) {
-      return res.status(400).json({ error: 'title, price and category are required.' });
-    }
-
-    const priceNum = Number(price);
-    if (!Number.isFinite(priceNum) || priceNum < 0) {
-      return res.status(400).json({ error: 'Price must be a valid non-negative number.' });
-    }
-
-    if (!Array.isArray(size) || size.length === 0) {
-      return res.status(400).json({ error: 'At least one size must be selected.' });
-    }
-
-    const isDiscount = Boolean(discount);
-    const beforePriceNum = isDiscount ? Number(beforePrice) : 0;
-
-    if (isDiscount && (!Number.isFinite(beforePriceNum) || beforePriceNum <= priceNum)) {
-      return res.status(400).json({
-        error: 'Before price must be a valid amount greater than the selling price.',
-      });
-    }
-
-    if (
-      !Array.isArray(imagesLink) ||
-      imagesLink.length === 0 ||
-      imagesLink.some((image) => typeof image !== 'string' || !image.trim())
-    ) {
-      return res.status(400).json({ error: 'At least one valid product image is required.' });
-    }
-
-    function normalizePricedImages(items, label) {
-      if (!Array.isArray(items)) {
-        return { error: `${label} must be an array.` };
-      }
-
-      const normalized = [];
-
-      for (const [index, item] of items.entries()) {
-        const isLegacyUrl = typeof item === 'string';
-        const image = isLegacyUrl ? item : item?.image;
-        const rawPrice = isLegacyUrl ? 0 : item?.price;
-        const optionPrice = Number(rawPrice);
-
-        if (typeof image !== 'string' || !image.trim()) {
-          return { error: `${label} option ${index + 1} must include an image URL.` };
-        }
-
-        if (
-          rawPrice === undefined ||
-          rawPrice === null ||
-          rawPrice === '' ||
-          !Number.isFinite(optionPrice) ||
-          optionPrice < 0
-        ) {
-          return { error: `${label} option ${index + 1} must have a valid non-negative price.` };
-        }
-
-        normalized.push({ image: image.trim(), price: optionPrice });
-      }
-
-      return { value: normalized };
-    }
-
-    const patchOptions = patch
-      ? normalizePricedImages(patchsImg, 'Patch')
-      : { value: [] };
-
-    if (patchOptions.error) {
-      return res.status(400).json({ error: patchOptions.error });
-    }
-    if (patch && patchOptions.value.length === 0) {
-      return res.status(400).json({ error: 'Patch is enabled but no patch options were provided.' });
-    }
-
-    const fontOptions = font
-      ? normalizePricedImages(fontsImg, 'Font')
-      : { value: [] };
-
-    if (fontOptions.error) {
-      return res.status(400).json({ error: fontOptions.error });
-    }
-    if (font && fontOptions.value.length === 0) {
-      return res.status(400).json({ error: 'Font is enabled but no font options were provided.' });
-    }
-
-    const doc = {
-      title: title.trim(),
-      desc: desc ?? '',
-      price: priceNum,
-      discount: isDiscount,
-      beforePrice: beforePriceNum,
-      discountPercent: isDiscount
-        ? Math.round(((beforePriceNum - priceNum) / beforePriceNum) * 100)
-        : 0,
-      size,
-      patch: Boolean(patch),
-      font: Boolean(font),
-      featured: Boolean(featured),
-      stock: Number(stock) || 0,
-      team: team ?? '',
-      seassion: seassion ?? '',
-      category: category.trim(),
-      imagesLink,
-      patchsImg: patchOptions.value,
-      fontsImg: fontOptions.value,
-      createdAt: new Date(),
-    };
-
-    const result = await products.insertOne(doc);
-    return res.status(201).json({ data: { _id: result.insertedId, ...doc } });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Something went wrong while creating the product.' });
-  }
-});
-
-app.get('/admin/feature-count', async (req, res) => {
-  if (!products) return res.status(503).json({ error: 'Database not connected yet' });
-
-  try {
-    const result = await products.countDocuments({ featured: true })
-
-    res.status(200).json({ data: result });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
-  }
-})
-
-app.put('/admin/products/:id', async (req, res) => {
-  if (!products) {
-    return res.status(503).json({ error: 'Database not connected yet' });
-  }
-
-  let productId;
-  try {
-    productId = new ObjectId(req.params.id);
-  } catch {
-    return res.status(400).json({ error: 'Invalid product id.' });
-  }
-
-  try {
-    const {
-      title,
-      desc = '',
-      price,
-      size = [],
-      patch = false,
-      font = false,
-      featured = false,
-      discount = false,
-      beforePrice,
-      stock = 0,
-      team = '',
-      seassion = '',
-      category,
-      imagesLink = [],
-      patchsImg = [],
-      fontsImg = [],
-    } = req.body ?? {};
-
-    if (!title?.trim() || price === undefined || price === null || !category?.trim()) {
-      return res.status(400).json({ error: 'title, price and category are required.' });
-    }
-
-    const priceNum = Number(price);
-    if (!Number.isFinite(priceNum) || priceNum < 0) {
-      return res.status(400).json({ error: 'Price must be a valid non-negative number.' });
-    }
-
-    const stockNum = Number(stock);
-    if (!Number.isFinite(stockNum) || stockNum < 0) {
-      return res.status(400).json({ error: 'Stock must be a valid non-negative number.' });
-    }
-
-    if (!Array.isArray(size) || size.length === 0) {
-      return res.status(400).json({ error: 'At least one size must be selected.' });
-    }
-
-    const isDiscount = Boolean(discount);
-    const beforePriceNum = isDiscount ? Number(beforePrice) : 0;
-
-    if (isDiscount && (!Number.isFinite(beforePriceNum) || beforePriceNum <= priceNum)) {
-      return res.status(400).json({
-        error: 'Before price must be greater than the selling price.',
-      });
-    }
-
-    if (
-      !Array.isArray(imagesLink) ||
-      imagesLink.length === 0 ||
-      imagesLink.some((image) => typeof image !== 'string' || !image.trim())
-    ) {
-      return res.status(400).json({ error: 'At least one valid product image is required.' });
-    }
-
-    function normalizePricedImages(items, label) {
-      if (!Array.isArray(items)) {
-        return { error: `${label} must be an array.` };
-      }
-
-      const normalized = [];
-
-      for (const [index, item] of items.entries()) {
-        const isLegacyUrl = typeof item === 'string';
-        const image = isLegacyUrl ? item : item?.image;
-        const rawPrice = isLegacyUrl ? 0 : item?.price;
-        const optionPrice = Number(rawPrice);
-
-        if (typeof image !== 'string' || !image.trim()) {
-          return { error: `${label} option ${index + 1} must include an image URL.` };
-        }
-
-        if (
-          rawPrice === undefined ||
-          rawPrice === null ||
-          rawPrice === '' ||
-          !Number.isFinite(optionPrice) ||
-          optionPrice < 0
-        ) {
-          return { error: `${label} option ${index + 1} must have a valid non-negative price.` };
-        }
-
-        normalized.push({ image: image.trim(), price: optionPrice });
-      }
-
-      return { value: normalized };
-    }
-
-    const patchOptions = patch
-      ? normalizePricedImages(patchsImg, 'Patch')
-      : { value: [] };
-
-    if (patchOptions.error) {
-      return res.status(400).json({ error: patchOptions.error });
-    }
-    if (patch && patchOptions.value.length === 0) {
-      return res.status(400).json({ error: 'Patch is enabled but no patch options were provided.' });
-    }
-
-    const fontOptions = font
-      ? normalizePricedImages(fontsImg, 'Font')
-      : { value: [] };
-
-    if (fontOptions.error) {
-      return res.status(400).json({ error: fontOptions.error });
-    }
-    if (font && fontOptions.value.length === 0) {
-      return res.status(400).json({ error: 'Font is enabled but no font options were provided.' });
-    }
-
-    const updatedProduct = {
-      title: title.trim(),
-      desc,
-      price: priceNum,
-      discount: isDiscount,
-      beforePrice: beforePriceNum,
-      discountPercent: isDiscount
-        ? Math.round(((beforePriceNum - priceNum) / beforePriceNum) * 100)
-        : 0,
-      size,
-      patch: Boolean(patch),
-      font: Boolean(font),
-      featured: Boolean(featured),
-      stock: stockNum,
-      team,
-      seassion,
-      category: category.trim(),
-      imagesLink,
-      patchsImg: patchOptions.value,
-      fontsImg: fontOptions.value,
-      updatedAt: new Date(),
-    };
-
-    const result = await products.updateOne(
-      { _id: productId },
-      { $set: updatedProduct }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'Product not found.' });
-    }
-
-    return res.status(200).json({
-      data: { _id: productId, ...updatedProduct },
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Something went wrong while updating the product.' });
-  }
-});
-
-app.delete('/admin/products/:id', async (req, res) => {
-  if (!products) {
-    return res.status(503).json({ error: 'Database not connected yet' });
-  }
-
-  let productId;
-  try {
-    productId = new ObjectId(req.params.id);
-  } catch {
-    return res.status(400).json({ error: 'Invalid product id.' });
-  }
-
-  try {
-    const result = await products.deleteOne({ _id: productId });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ error: 'Product not found.' });
-    }
-
-    return res.status(200).json({ data: { _id: req.params.id } });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Something went wrong while deleting the product.' });
-  }
-});
-
-
-
-app.get('/admin/orders', async (req, res) => {
-  if (!orders) {
-    return res.status(503).json({ error: 'Database not connected yet' });
-  }
-
-  try {
-    const result = await orders
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    return res.status(200).json({ data: result });
-  } catch (err) {
-    console.error('Failed to load admin orders:', err);
-    return res.status(500).json({ error: 'Could not load orders.' });
-  }
-});
-
-app.put('/admin/orders/:id/status', async (req, res) => {
-  if (!orders) {
-    return res.status(503).json({ error: 'Database not connected yet' });
-  }
-
-  const orderId = String(req.params.id ?? '').trim();
-  const requestedStatus = req.body?.status;
-  if (!orderId || orderId.length > 100 || typeof requestedStatus !== 'string') {
-    return res.status(400).json({ error: 'A valid order ID and status are required.' });
-  }
-
-  const statusText = requestedStatus.trim();
-  if (!statusText || statusText.length > 40) {
-    return res.status(400).json({ error: 'Status must be between 1 and 40 characters.' });
-  }
-
-  const knownStatuses = new Map([
-    ['pending', 'pending'],
-    ['processing', 'processing'],
-    ['shipped', 'shipped'],
-    ['on the way', 'shipped'],
-    ['delivered', 'delivered'],
-    ['cancelled', 'cancelled'],
-    ['canceled', 'cancelled'],
-  ]);
-  const status = knownStatuses.get(statusText.toLowerCase()) ?? statusText;
-  const filter = ObjectId.isValid(orderId)
-    ? { _id: new ObjectId(orderId) }
-    : { orderId };
-
-  try {
-    const result = await orders.updateOne(
-      filter,
-      { $set: { status, updatedAt: new Date() } }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'Order not found.' });
-    }
-
-    return res.status(200).json({ data: { id: orderId, status } });
-  } catch (err) {
-    console.error('Failed to update order status:', err);
-    return res.status(500).json({ error: 'Could not update order status.' });
-  }
-});
-
-app.use('/admin', createAdminDashboardRouter(() => ({ products, orders, financeTx, financeSettings })));
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
-
-
-module.exports = app;
